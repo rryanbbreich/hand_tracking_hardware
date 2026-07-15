@@ -97,4 +97,4 @@ with HandLandmarker.create_from_options(options) as landmarker:
 if arduino:
     arduino.close() # Safely unlock the USB port when quitting
 cap.release()
-cv2.destroyAllWindows()
+cv2.destroyAllWindows() #done
