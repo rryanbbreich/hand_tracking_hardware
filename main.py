@@ -2,15 +2,14 @@ import cv2
 import mediapipe as mp
 import time
 import math
-import serial  # <--- NEW: Import the Serial library to talk to hardware
+import serial
 
-# 1. SETUP SERIAL PORT (ADJUST COM PORT NUMBER TO MATCH YOUR ARDUINO)
+# Setup Serial Communication
 try:
-    # Change 'COM3' to whatever port your Arduino uses when plugged in
-    arduino = serial.Serial(port='COM3', baudrate=9600, timeout=0.1)
+    arduino = serial.Serial(port='COM4', baudrate=9600, timeout=0.1) # Match your COM port
     print("SUCCESS: Connected to Arduino!")
 except Exception as e:
-    print("WARNING: Arduino not detected. Running in simulation mode.")
+    print("WARNING: Running in simulation mode.")
     arduino = None
 
 BaseOptions = mp.tasks.BaseOptions
@@ -19,7 +18,12 @@ HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
 latest_result = None
-last_send_time = 0  # <--- NEW: Limit data speed so we don't crash the hardware
+last_send_time = 0
+
+# --- NEW: SYSTEM STATE MEMORY VARIABLES ---
+stored_brightness = 0       # Holds the last locked-in brightness value
+is_pinching = False         # Tracks if the user is actively adjusting right now
+smoothed_brightness = 0     # Blended value to eliminate hand jitter
 
 def print_result(result: mp.tasks.vision.HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
     global latest_result
@@ -42,59 +46,81 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
         frame = cv2.flip(frame, 1)
         h, w, c = frame.shape
+        
+        # --- NEW: DRAW VISUAL ENGAGEMENT ZONES ---
+        # Split the screen vertically down the middle
+        midline_x = w // 2
+        cv2.line(frame, (midline_x, 0), (midline_x, h), (100, 100, 100), 1)
+        cv2.putText(frame, "DEAD ZONE", (30, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+        cv2.putText(frame, "CONTROL ZONE", (midline_x + 20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
         frame_timestamp_ms = int(time.time() * 1000)
         landmarker.detect_async(mp_image, frame_timestamp_ms)
 
+        # Clear active status text per frame unless updated by detection
+        current_status = "IDLE (Holding Memory)"
+
         if latest_result and latest_result.hand_landmarks:
             for hand_landmarks in latest_result.hand_landmarks:
                 
-                # Extract landmarks for fingers
+                # Get target joints
                 thumb = hand_landmarks[4]
                 index = hand_landmarks[8]
-                middle_tip = hand_landmarks[12]
-                middle_base = hand_landmarks[9]
-
+                
                 tx, ty = int(thumb.x * w), int(thumb.y * h)
                 ix, iy = int(index.x * w), int(index.y * h)
-                my_tip = int(middle_tip.y * h)
-                my_base = int(middle_base.y * h)
+                
+                # Calculate hand center to see which zone it is inside
+                hand_center_x = (tx + ix) // 2
 
-                # --- GESTURE 1: TOGGLE SWITCH ---
-                if my_tip < my_base:
-                    gesture_status = "SYSTEM: ON"
-                    text_color = (0, 255, 0)
-                    hardware_command = "H" # 'H' for High/On
-                else:
-                    gesture_status = "SYSTEM: OFF"
-                    text_color = (0, 0, 255)
-                    hardware_command = "L" # 'L' for Low/Off
-
-                # --- GESTURE 2: PINCH DIMMER ---
-                distance = math.hypot(ix - tx, iy - ty)
-                brightness_pct = int(((distance - 20) / 130) * 100)
-                brightness_pct = max(0, min(100, brightness_pct))
-
-                # --- NEW: SEND DATA TO ARDUINO ---
-                # We limit sending to once every 50ms so the Arduino isn't overwhelmed
-                current_time = time.time()
-                if arduino and (current_time - last_send_time > 0.05):
-                    # Package data as string: "H,45\n" (Command,SliderValue)
-                    data_packet = f"{hardware_command},{brightness_pct}\n"
+                # --- ADVANCED LOGIC: ZONE FILTERING ---
+                if hand_center_x > midline_x:
+                    # Calculate pinch distance
+                    distance = math.hypot(ix - tx, iy - ty)
                     
-                    # Convert text to raw bytes and send down the USB cord
-                    arduino.write(data_packet.encode('utf-8'))
-                    last_send_time = current_time
+                    # If fingers are very close (under 30 pixels), register a pinch engagement
+                    if distance < 30:
+                        is_pinching = True
+                        current_status = "ADJUSTING BRIGHTNESS"
+                        
+                        # Draw an engagement line between fingers
+                        cv2.line(frame, (tx, ty), (ix, iy), (0, 255, 255), 3)
+                        
+                        # Use the vertical Y position of your pinched hand as the slider height!
+                        # Moving your pinched hand UP decreases Y pixel coordinate, so we invert it.
+                        raw_pct = int(((h - ty) / h) * 100)
+                        target_val = max(0, min(100, raw_pct))
+                        
+                        # Smooth out the jumping numbers (Low-pass filter math)
+                        smoothed_brightness = int(smoothed_brightness * 0.7 + target_val * 0.3)
+                        stored_brightness = smoothed_brightness
+                    else:
+                        is_pinching = False
+                        current_status = "READY (Pinch to grab slider)"
+                        cv2.circle(frame, (tx, ty), 6, (255, 0, 0), cv2.FILLED)
+                        cv2.circle(frame, (ix, iy), 6, (0, 255, 0), cv2.FILLED)
+                else:
+                    current_status = "IGNORED (Inside Dead Zone)"
 
-                # Display info
-                cv2.putText(frame, f"Switch: {gesture_status}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, text_color, 2)
-                cv2.putText(frame, f"Slider Level: {brightness_pct}%", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        # --- OUTBOUND HARDWARE DATA PIPELINE ---
+        current_time = time.time()
+        if arduino and (current_time - last_send_time > 0.05):
+            # We always broadcast the stored_brightness memory value!
+            # Using 'H' as a generic active command character placeholder
+            data_packet = f"H,{stored_brightness}\n"
+            arduino.write(data_packet.encode('utf-8'))
+            last_send_time = current_time
 
-        cv2.imshow("Gesture Engine Control Panel", frame)
+        # UI Overlay Dashboard
+        cv2.putText(frame, f"Status: {current_status}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Hardware LED Output: {stored_brightness}%", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        cv2.imshow("Advanced Interface Engine", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 if arduino:
-    arduino.close() # Safely unlock the USB port when quitting
+    arduino.close()
 cap.release()
-cv2.destroyAllWindows() #done
+cv2.destroyAllWindows()
