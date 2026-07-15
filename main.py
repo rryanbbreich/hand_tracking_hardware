@@ -6,7 +6,7 @@ import serial
 
 # Setup Serial Communication
 try:
-    arduino = serial.Serial(port='COM4', baudrate=9600, timeout=0.1) # Match your COM port
+    arduino = serial.Serial(port='COM3', baudrate=9600, timeout=0.1) # Match your COM port
     print("SUCCESS: Connected to Arduino!")
 except Exception as e:
     print("WARNING: Running in simulation mode.")
